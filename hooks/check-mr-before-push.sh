@@ -25,9 +25,10 @@ INPUT=$(cat)
 COMMAND=$(echo "$INPUT" | jq -r '.tool_input.command // ""')
 COMMAND_FLAT=$(printf '%s' "$COMMAND" | tr '\n\r' '  ')
 
-# ---- 只拦截 git push（兼容多种写法：git push、git -C path push、git -c xxx push）----
+# ---- 只拦截 git push / git send-pack（兼容多种写法）----
+# send-pack 是底层传输命令，不触发 git hooks，Claude 会用它绕过 pre-push hook。
 # 注意：不能对整个 COMMAND_FLAT 做 grep，因为 commit message / heredoc 里可能包含 "git push" 文本。
-# 策略：用 && / ; / | 分割命令，逐段检查是否有 git push 子命令。
+# 策略：用 && / ; / | 分割命令，逐段检查是否有 git push / git send-pack 子命令。
 IS_GIT_PUSH=0
 while IFS= read -r segment; do
   # 去掉前后空格
@@ -36,13 +37,13 @@ while IFS= read -r segment; do
   if echo "$segment" | grep -qE '^git[[:space:]]+(commit|add|log|diff|show|tag|stash|rebase|merge|cherry-pick|revert)'; then
     continue
   fi
-  # 检查是否是 git push
-  if echo "$segment" | grep -qE '^git[[:space:]]+([^|;&]*[[:space:]]+)?push([[:space:]]|$)'; then
+  # 检查是否是 git push 或 git send-pack
+  if echo "$segment" | grep -qE '^git[[:space:]]+([^|;&]*[[:space:]]+)?(push|send-pack)([[:space:]]|$)'; then
     IS_GIT_PUSH=1
     break
   fi
-  # 兼容 cd xxx && git push
-  if echo "$segment" | grep -qE 'git[[:space:]]+([^|;&]*[[:space:]]+)?push([[:space:]]|$)' && \
+  # 兼容 cd xxx && git push / send-pack
+  if echo "$segment" | grep -qE 'git[[:space:]]+([^|;&]*[[:space:]]+)?(push|send-pack)([[:space:]]|$)' && \
      ! echo "$segment" | grep -qE 'git[[:space:]]+(commit|add|log|diff|show|tag)'; then
     IS_GIT_PUSH=1
     break
@@ -62,6 +63,7 @@ fi
 #   1. --no-verify / -n  → 绕 git pre-push（L1 物理防线）
 #   2. core.hooksPath=/dev/null / core.hooksPath= → 同上（Case A3 实证）
 #   3. GIT_PUSH_SKIP_MERGED_CHECK=1 之类的 env 绕过 → Claude 自造的（Case C1 实证）
+#   4. git send-pack → 底层传输命令，不触发 pre-push hook（2026-05-14 实证）
 BYPASS_REASON=""
 if echo "$COMMAND_FLAT" | grep -qE -- '(^|[[:space:]])(--no-verify|-n)([[:space:]]|$)' && \
    echo "$COMMAND_FLAT" | grep -qE 'git[[:space:]]+([^|;&]*[[:space:]]+)?push'; then
@@ -80,6 +82,12 @@ fi
 if echo "$COMMAND_FLAT" | grep -qE '(GIT_PUSH_SKIP_MERGED_CHECK|SKIP_MERGED_CHECK|SKIP_HOOK)[[:space:]]*=[[:space:]]*[1-9yYtT]'; then
   if [ -z "$BYPASS_REASON" ]; then
     BYPASS_REASON="检测到 SKIP_MERGED_CHECK / SKIP_HOOK 类环境变量绕过"
+  fi
+fi
+# 4. git send-pack → 底层命令绕过 pre-push hook
+if echo "$COMMAND_FLAT" | grep -qE 'git[[:space:]]+send-pack'; then
+  if [ -z "$BYPASS_REASON" ]; then
+    BYPASS_REASON="检测到 git send-pack（底层传输命令，会绕过 pre-push hook，禁用）"
   fi
 fi
 
@@ -118,8 +126,9 @@ EOMSG
   exit 0
 fi
 
-# ---- 解析实际工作目录（处理 cd dir && git push 模式 + worktree）----
+# ---- 解析实际工作目录（处理 cd dir / git -C dir / GIT_WORK_TREE=dir 模式）----
 REPO_DIR=""
+# 1. cd dir && git push
 if [[ "$COMMAND_FLAT" == *"cd "*"git "*"push"* ]]; then
   rest="${COMMAND_FLAT#*cd }"
   while [[ "$rest" == [[:space:]]* ]]; do rest="${rest:1}"; done
@@ -134,6 +143,23 @@ if [[ "$COMMAND_FLAT" == *"cd "*"git "*"push"* ]]; then
     i=$((i + 1))
   done
   REPO_DIR="$candidate"
+fi
+# 2. git -C <path> push
+if [ -z "$REPO_DIR" ]; then
+  C_PATH=$(echo "$COMMAND_FLAT" | grep -oE 'git[[:space:]]+-C[[:space:]]+[^[:space:]]+' | head -1 | sed 's/git[[:space:]]*-C[[:space:]]*//')
+  # 展开 ~ 为 $HOME
+  C_PATH="${C_PATH/#\~/$HOME}"
+  if [ -n "$C_PATH" ] && [ -d "$C_PATH" ]; then
+    REPO_DIR="$C_PATH"
+  fi
+fi
+# 3. GIT_WORK_TREE=<path> 环境变量
+if [ -z "$REPO_DIR" ]; then
+  GWT_PATH=$(echo "$COMMAND_FLAT" | grep -oE 'GIT_WORK_TREE=[^[:space:]]+' | head -1 | sed 's/GIT_WORK_TREE=//')
+  GWT_PATH="${GWT_PATH/#\~/$HOME}"
+  if [ -n "$GWT_PATH" ] && [ -d "$GWT_PATH" ]; then
+    REPO_DIR="$GWT_PATH"
+  fi
 fi
 
 if [ -z "$REPO_DIR" ] || [ ! -d "$REPO_DIR" ]; then
