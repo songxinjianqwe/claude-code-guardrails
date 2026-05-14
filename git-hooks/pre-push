@@ -1,0 +1,174 @@
+#!/bin/bash
+# .git/hooks/pre-push（系统级 git hook，物理防线 L1）
+#
+# 防止 push 一个 HEAD 已经是 master/main 祖先的分支
+# = 防止往"已被 merge 的分支"继续 push 内容
+#
+# 这是 Claude Code 之外的物理防线：对所有 git 客户端生效
+# （命令行 / IDE / Claude Code / Cursor / 任何 AI agent）
+# Claude 改写命令前缀、用 git -C、用 bash -c 都绕不过
+#
+# git pre-push hook 协议：
+#   $1 = remote name (e.g. origin)
+#   $2 = remote URL
+#   stdin 每行格式：<local_ref> <local_sha> <remote_ref> <remote_sha>
+#
+# 非 0 退出 = 阻止 push
+#
+# 紧急逃生口：BYPASS_MERGED_CHECK=1 git push ...
+#   仅在极个别需要 force push 修复非 merged 分支的场景使用
+#   每次使用都会写一行审计日志到 ~/.claude/logs/pre-push-bypass.log
+
+set -e
+
+REMOTE="$1"
+REMOTE_URL="$2"
+
+# ---- 紧急绕过开关（必须显式设置环境变量）----
+if [ "${BYPASS_MERGED_CHECK:-0}" = "1" ]; then
+  LOG_DIR="$HOME/.claude/logs"
+  mkdir -p "$LOG_DIR"
+  TS=$(date '+%Y-%m-%d %H:%M:%S')
+  USER_INFO=$(whoami)
+  CWD=$(pwd)
+  echo "[$TS] user=$USER_INFO cwd=$CWD remote=$REMOTE url=$REMOTE_URL BYPASSED" >> "$LOG_DIR/pre-push-bypass.log"
+  echo "⚠️  BYPASS_MERGED_CHECK=1 已设置，pre-push 检查被跳过（已记录到审计日志）" >&2
+  exit 0
+fi
+
+# ---- 自动探测主分支（master 优先，否则 main）----
+MAIN_BRANCH=""
+for candidate in master main; do
+  if git show-ref --verify --quiet "refs/remotes/$REMOTE/$candidate" 2>/dev/null; then
+    MAIN_BRANCH="$candidate"
+    break
+  fi
+done
+
+if [ -z "$MAIN_BRANCH" ]; then
+  # 找不到 master/main，不应该发生但兜底放行
+  exit 0
+fi
+
+# ---- 把主分支远端引用更新到最新（防止本地缓存落后）----
+git fetch "$REMOTE" "$MAIN_BRANCH" --quiet 2>/dev/null || true
+
+# ---- 逐个待 push 的 ref 检查 ----
+BLOCKED=0
+EMPTY_SHA="0000000000000000000000000000000000000000"
+
+while read local_ref local_sha remote_ref remote_sha; do
+  # 跳过空行
+  [ -z "$local_ref" ] && continue
+
+  # 跳过删除分支的 push（local_sha 为全 0）
+  if [ "$local_sha" = "$EMPTY_SHA" ]; then
+    continue
+  fi
+
+  # 跳过 push 到主分支本身（这种情况由其他规则管，不在本 hook 职责内）
+  case "$remote_ref" in
+    refs/heads/master|refs/heads/main|refs/heads/dev|refs/heads/develop)
+      continue
+      ;;
+  esac
+
+  # ===== 核心检查：两种"已 merged"场景 =====
+  #
+  # 场景 1: local_sha 本身已经是 master 祖先
+  #   = 你正在 push 的这个 commit 内容已经被合入主分支
+  #   常见情形: amend 一个已 merged 的 commit、cherry-pick 后重 push
+  #
+  # 场景 2: remote_sha（远端分支当前 HEAD）已经是 master 祖先
+  #   = 你 push 的目标远端分支已经被合，但本地 HEAD 比远端新（追加了 commit）
+  #   常见情形（最容易踩的坑）：用户合了 MR → 你在同一 worktree 继续改 → 加 commit → push
+  #   实证案例：2026-05-11 晚 infra-knowledgebase-parser OCR 并发改动
+  EMPTY_SHA_RE="^0+$"
+
+  # 注：不对 HEAD==MAIN 做豁免。如果你的 local_sha 等于 master HEAD，
+  # is-ancestor 返回 true 是正确的——这个 commit 确实在 master 里。
+  # 新建分支应该先 commit 再 push，不应该 push 空分支。
+
+  # 场景 1
+  if git merge-base --is-ancestor "$local_sha" "$REMOTE/$MAIN_BRANCH" 2>/dev/null; then
+    HIT_SCENE=1
+  # 场景 2：remote_sha 非空（不是新建分支）且已是 master 祖先
+  elif [ -n "$remote_sha" ] && ! [[ "$remote_sha" =~ $EMPTY_SHA_RE ]] && \
+       git merge-base --is-ancestor "$remote_sha" "$REMOTE/$MAIN_BRANCH" 2>/dev/null; then
+    HIT_SCENE=2
+  else
+    HIT_SCENE=0
+  fi
+
+  if [ "$HIT_SCENE" != "0" ]; then
+    REMOTE_BRANCH="${remote_ref#refs/heads/}"
+    LOCAL_BRANCH="${local_ref#refs/heads/}"
+    SHORT_LOCAL=$(git rev-parse --short "$local_sha" 2>/dev/null || echo "$local_sha")
+    SHORT_REMOTE=""
+    if [ -n "$remote_sha" ] && ! [[ "$remote_sha" =~ $EMPTY_SHA_RE ]]; then
+      SHORT_REMOTE=$(git rev-parse --short "$remote_sha" 2>/dev/null || echo "$remote_sha")
+    fi
+
+    if [ "$HIT_SCENE" = "1" ]; then
+      SCENE_DESC="本地 HEAD ($SHORT_LOCAL) 已经是 $REMOTE/$MAIN_BRANCH 的祖先。
+        这说明该分支的内容已经被合并进主分支了。"
+    else
+      SCENE_DESC="远端分支当前 HEAD ($SHORT_REMOTE) 已经是 $REMOTE/$MAIN_BRANCH 的祖先。
+        = 你正在往一个已被 merge 的分支追加新 commit。
+        新 commit 推上去也只是落到 stale 远端分支上，不会进入主分支。"
+    fi
+
+    cat >&2 <<EOF
+
+🚨🚨🚨 PUSH 被 pre-push hook 拦截 🚨🚨🚨
+
+  本地分支       : $LOCAL_BRANCH
+  远端目标分支   : $REMOTE_BRANCH
+  本地 HEAD      : $SHORT_LOCAL
+  远端 HEAD      : ${SHORT_REMOTE:-(新分支)}
+  主分支         : $REMOTE/$MAIN_BRANCH
+  命中场景       : $HIT_SCENE
+
+  原因：$SCENE_DESC
+
+  继续 push 的后果：
+  - 如果分支对应的 MR 已 merged：新 commit 会落在孤儿历史上，永远进不了主分支
+  - 你的改动 = 白做
+
+  ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  正确做法（强制流程）：
+  ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  1. 回到主仓库（不是当前 worktree）：
+     cd <主仓库路径>
+
+  2. 同步最新 master：
+     git checkout $MAIN_BRANCH
+     git pull origin $MAIN_BRANCH
+
+  3. 开新 worktree + 新分支：
+     git worktree add ../.claude/worktrees/<new-name> -b <new-name> origin/$MAIN_BRANCH
+
+  4. 进入新 worktree，cherry-pick 当前未合并的 commit：
+     cd ../.claude/worktrees/<new-name>
+     git cherry-pick <你想保留的 commit hash>
+
+  5. push 新分支 + 新建 MR：
+     git push -u $REMOTE <new-name>
+     glab mr create --target-branch $MAIN_BRANCH
+
+  ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  紧急绕过（仅极少数场景使用，会记审计日志）：
+    BYPASS_MERGED_CHECK=1 git push ...
+  ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+EOF
+    BLOCKED=1
+  fi
+done
+
+if [ "$BLOCKED" = "1" ]; then
+  exit 1
+fi
+
+exit 0
