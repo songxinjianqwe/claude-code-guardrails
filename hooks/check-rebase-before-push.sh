@@ -79,11 +79,6 @@ if [ -z "$BEHIND" ] || [ "$BEHIND" = "0" ]; then
   exit 0
 fi
 
-# 容忍落后 3 个以内（master 活跃时 rebase 完到 push 之间可能又有新合入，不算问题）
-if [ "$BEHIND" -le 3 ]; then
-  exit 0
-fi
-
 # 落后 → block，给出明确操作步骤
 REASON=$(cat <<EOMSG
 分支 $BRANCH 落后 origin/$DEFAULT $BEHIND 个提交，push 前必须 rebase。
