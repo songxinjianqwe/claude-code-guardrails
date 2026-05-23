@@ -393,6 +393,24 @@ else
   fail "Test 8e: core.hooksPath=任意路径 没被拦 (output: $OUTPUT)"
 fi
 
+echo ""
+info "Test 8f: git -C 路径含未展开变量(\$VAR) → block 提示用字面路径"
+
+REPO=$(setup_repo "test8f")
+cd "$REPO"
+git checkout -q -b feat-dynpath
+echo "x" > x.txt && git add x.txt && git commit -q -m "wip"
+
+# 命令里 git -C 的路径是未展开的 $W（Claude 用变量拼路径的典型写法）。
+# hook 在命令执行前只能看到字面量，解析不出真实目录，必须 block 并提示改用字面路径，
+# 而不是静默回退到 cwd 把别的 worktree 的 merged 状态误套上来（2026-05 实证）。
+OUTPUT=$(run_check_mr_before_push "$REPO" "git -C \$W push -u origin feat-dynpath")
+if echo "$OUTPUT" | grep -q '"decision":"block"' && echo "$OUTPUT" | grep -q "未展开变量"; then
+  ok "Test 8f: 路径含 \$变量 被拦截并提示用字面路径"
+else
+  fail "Test 8f: 路径含 \$变量 没被正确拦截 (output: $OUTPUT)"
+fi
+
 # ========================================
 # Test 9: check-branch-merged-before-edit 拦截已 merged 分支 Edit
 # ========================================
