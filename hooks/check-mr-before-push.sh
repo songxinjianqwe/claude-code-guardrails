@@ -85,11 +85,8 @@ if echo "$COMMAND_FLAT" | grep -qE '(GIT_PUSH_SKIP_MERGED_CHECK|SKIP_MERGED_CHEC
   fi
 fi
 # 4. git send-pack → 底层命令绕过 pre-push hook
-if echo "$COMMAND_FLAT" | grep -qE 'git[[:space:]]+send-pack'; then
-  if [ -z "$BYPASS_REASON" ]; then
-    BYPASS_REASON="检测到 git send-pack（底层传输命令，会绕过 pre-push hook，禁用）"
-  fi
-fi
+#    不直接 block 为"绕过"（避免 commit message 里出现 send-pack 文字误触发）
+#    而是让它走正常 merged 检查流程——分段逻辑已经把 send-pack 识别为 IS_GIT_PUSH=1
 
 if [ -n "$BYPASS_REASON" ]; then
   REASON=$(cat <<EOMSG
@@ -162,7 +159,33 @@ if [ -z "$REPO_DIR" ]; then
   fi
 fi
 
+# ---- 显式指定了路径但解析不出真实目录：通常是路径含未展开的 $变量 / 命令替换 ----
+# hook 在命令执行前只能拿到字面量，无法展开 $VAR。这种情况绝不能静默回退到 cwd——
+# cwd 往往停在别的 worktree 上，会把"那个分支已 merged"误套到本次 push（2026-05-23 实证：
+# git -C "$W" push 被误判为已 merged）。改为直接拦截并要求改用字面路径。
 if [ -z "$REPO_DIR" ] || [ ! -d "$REPO_DIR" ]; then
+  DYNAMIC_PATH=0
+  if echo "$COMMAND_FLAT" | grep -qE 'git[[:space:]]+-C[[:space:]]+[^[:space:];&|]*[$`]' \
+     || echo "$COMMAND_FLAT" | grep -qE 'GIT_WORK_TREE=[^[:space:];&|]*[$`]' \
+     || echo "$COMMAND_FLAT" | grep -qE '(^|[;&|])[[:space:]]*cd[[:space:]]+[^[:space:];&|]*[$`]'; then
+    DYNAMIC_PATH=1
+  fi
+  if [ "$DYNAMIC_PATH" = "1" ]; then
+    REASON=$(cat <<'EOMSG'
+🚨 PUSH 被拦截：路径含未展开变量，无法静态判断目标分支
+
+命令里的 git -C / cd / GIT_WORK_TREE 路径包含 shell 变量（$VAR）或命令替换（`...` / $(...)）。
+hook 在命令执行前只能看到字面量，无法展开成真实目录，也就无法可靠判断目标分支是否已 merged。
+为避免静默回退到当前工作目录（很可能是另一个 worktree）导致误判，这里直接拦截。
+
+✅ 正确做法：把路径写成完整字面量再重试，例如
+   git -C /abs/path/to/worktree push -u origin <branch>
+   或  cd /abs/path/to/worktree && git push -u origin <branch>
+EOMSG
+)
+    printf '{"decision":"block","reason":%s}' "$(printf '%s' "$REASON" | jq -Rs .)"
+    exit 0
+  fi
   REPO_DIR=$(echo "$INPUT" | jq -r '.tool_input.cwd // .cwd // ""')
 fi
 
